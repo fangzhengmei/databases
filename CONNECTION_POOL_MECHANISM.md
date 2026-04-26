@@ -326,6 +326,513 @@ def connection(self) -> "Connection":
 
 ---
 
+## 事务机制深度分析
+
+### 1. Transaction 类的核心设计
+
+#### 1.1 两种 transaction() 入口
+
+`Database` 和 `Connection` 都提供了 `transaction()` 方法，但实现略有不同：
+
+**Database.transaction()**:
+```python
+# databases/core.py:225-228
+def transaction(
+    self, *, force_rollback: bool = False, **kwargs: typing.Any
+) -> "Transaction":
+    return Transaction(self.connection, force_rollback=force_rollback, **kwargs)
+```
+
+**Connection.transaction()**:
+```python
+# databases/core.py:338-344
+def transaction(
+    self, *, force_rollback: bool = False, **kwargs: typing.Any
+) -> "Transaction":
+    def connection_callable() -> Connection:
+        return self
+
+    return Transaction(connection_callable, force_rollback, **kwargs)
+```
+
+**关键差异**：
+- `Database.transaction()` 传入的是 `self.connection` **方法**（延迟调用）
+- `Connection.transaction()` 通过闭包返回自身
+
+这种设计允许 `Transaction` 类在需要时才获取连接，提高了灵活性。
+
+#### 1.2 Transaction 类结构
+
+```python
+# databases/core.py:367-408
+class Transaction:
+    def __init__(
+        self,
+        connection_callable: typing.Callable[[], Connection],
+        force_rollback: bool,
+        **kwargs: typing.Any,
+    ) -> None:
+        self._connection_callable = connection_callable
+        self._force_rollback = force_rollback
+        self._extra_options = kwargs
+
+    @property
+    def _transaction(self) -> typing.Optional["TransactionBackend"]:
+        transactions = _ACTIVE_TRANSACTIONS.get()
+        if transactions is None:
+            return None
+        return transactions.get(self, None)
+
+    @_transaction.setter
+    def _transaction(
+        self, transaction: typing.Optional["TransactionBackend"]
+    ) -> typing.Optional["TransactionBackend"]:
+        transactions = _ACTIVE_TRANSACTIONS.get()
+        if transactions is None:
+            transactions = weakref.WeakKeyDictionary()
+        else:
+            transactions = transactions.copy()  # 注意：每次修改都会创建副本
+
+        if transaction is None:
+            transactions.pop(self, None)
+        else:
+            transactions[self] = transaction
+
+        _ACTIVE_TRANSACTIONS.set(transactions)
+        return transactions.get(self, None)
+```
+
+**关键设计点**：
+1. `_ACTIVE_TRANSACTIONS`: 使用 `ContextVar` + `WeakKeyDictionary` 跟踪当前上下文中的活跃事务
+2. **Copy-on-write**: setter 中使用 `transactions.copy()`，确保 ContextVar 的正确更新
+3. 弱引用避免内存泄漏
+
+### 2. 嵌套事务处理机制
+
+#### 2.1 事务栈 (`_transaction_stack`)
+
+`Connection` 类维护一个事务栈来跟踪嵌套事务：
+
+```python
+# databases/core.py:238
+self._transaction_stack: typing.List[Transaction] = []
+```
+
+#### 2.2 `start()` 方法 - 事务启动流程
+
+```python
+# databases/core.py:448-458
+async def start(self) -> "Transaction":
+    # 1. 创建后端事务对象
+    self._transaction = self._connection._connection.transaction()
+
+    async with self._connection._transaction_lock:
+        # 2. 判断是否为根事务（栈为空则是根事务）
+        is_root = not self._connection._transaction_stack
+        
+        # 3. 关键：pin 住连接！调用 Connection.__aenter__()
+        await self._connection.__aenter__()
+        
+        # 4. 启动后端事务，传入 is_root 参数
+        await self._transaction.start(
+            is_root=is_root, extra_options=self._extra_options
+        )
+        
+        # 5. 将当前事务压入栈
+        self._connection._transaction_stack.append(self)
+    return self
+```
+
+**核心逻辑**：
+- `is_root = not self._connection._transaction_stack`: 栈为空表示这是第一个事务（根事务）
+- `await self._connection.__aenter__()`: 增加连接引用计数，**pin 住连接不释放**
+
+#### 2.3 `commit()` 方法 - 事务提交流程
+
+```python
+# databases/core.py:460-467
+async def commit(self) -> None:
+    async with self._connection._transaction_lock:
+        # 1. 断言：必须是当前最内层事务（栈顶）
+        assert self._connection._transaction_stack[-1] is self
+        
+        # 2. 从栈中弹出
+        self._connection._transaction_stack.pop()
+        
+        # 3. 提交后端事务
+        assert self._transaction is not None
+        await self._transaction.commit()
+        
+        # 4. 减少连接引用计数（可能释放连接）
+        await self._connection.__aexit__()
+        
+        # 5. 清理上下文变量
+        self._transaction = None
+```
+
+#### 2.4 `rollback()` 方法 - 事务回滚流程
+
+```python
+# databases/core.py:469-476
+async def rollback(self) -> None:
+    async with self._connection._transaction_lock:
+        # 1. 断言：必须是当前最内层事务
+        assert self._connection._transaction_stack[-1] is self
+        
+        # 2. 从栈中弹出
+        self._connection._transaction_stack.pop()
+        
+        # 3. 回滚后端事务
+        assert self._transaction is not None
+        await self._transaction.rollback()
+        
+        # 4. 减少连接引用计数
+        await self._connection.__aexit__()
+        
+        # 5. 清理上下文变量
+        self._transaction = None
+```
+
+#### 2.5 嵌套事务执行流程图
+
+```
+场景：双层嵌套事务
+
+async with db.transaction():  # 外层（根事务）
+    # 步骤：
+    # 1. start() 被调用
+    # 2. _transaction_stack 为空，is_root = True
+    # 3. __aenter__() → _connection_counter = 1, acquire()
+    # 4. 后端事务 start(is_root=True)
+    # 5. _transaction_stack = [tx1]
+    
+    async with db.transaction():  # 内层（嵌套事务）
+        # 步骤：
+        # 1. start() 被调用
+        # 2. _transaction_stack 非空，is_root = False
+        # 3. __aenter__() → _connection_counter = 2, 不 acquire
+        # 4. 后端事务 start(is_root=False) → 创建 SAVEPOINT
+        # 5. _transaction_stack = [tx1, tx2]
+        
+        pass  # 内层 commit
+        # 步骤：
+        # 1. commit() 被调用
+        # 2. 断言 _transaction_stack[-1] is tx2 ✓
+        # 3. _transaction_stack.pop() → [tx1]
+        # 4. 后端 commit() → RELEASE SAVEPOINT
+        # 5. __aexit__() → _connection_counter = 1, 不 release
+        
+    pass  # 外层 commit
+    # 步骤：
+    # 1. commit() 被调用
+    # 2. 断言 _transaction_stack[-1] is tx1 ✓
+    # 3. _transaction_stack.pop() → []
+    # 4. 后端 commit() → COMMIT
+    # 5. __aexit__() → _connection_counter = 0, release()
+```
+
+### 3. 连接 Pin 住机制
+
+#### 3.1 核心发现：事务期间连接被 Pin 住
+
+**关键机制**：
+
+| 操作 | 调用 | 连接计数器变化 |
+|------|------|----------------|
+| 事务启动 | `Transaction.start()` → `Connection.__aenter__()` | +1 |
+| 事务提交 | `Transaction.commit()` → `Connection.__aexit__()` | -1 |
+| 事务回滚 | `Transaction.rollback()` → `Connection.__aexit__()` | -1 |
+
+这意味着：
+1. **事务期间**：连接引用计数器 ≥ 1，连接**不会**被释放回池子
+2. **所有嵌套事务完成后**：计数器归零，连接才真正 `release()`
+
+#### 3.2 对比：普通查询 vs 事务查询
+
+**普通查询（无事务）**：
+```python
+await db.fetch_all("SELECT * FROM users")
+# 内部流程：
+# 1. async with db.connection() as conn:
+# 2.   __aenter__() → acquire (计数器 0→1)
+# 3.   执行查询
+# 4.   __aexit__() → release (计数器 1→0)
+# 连接立即返回池子！
+```
+
+**事务内查询**：
+```python
+async with db.transaction():
+    await db.fetch_all("SELECT * FROM users")  # 查询 1
+    await db.fetch_all("SELECT * FROM orders")  # 查询 2
+# 事务启动时：
+# start() → __aenter__() → 计数器 0→1, acquire
+
+# 查询 1 执行时：
+# async with db.connection() → __aenter__() → 计数器 1→2
+# 执行查询
+# __aexit__() → 计数器 2→1 (不 release!)
+
+# 查询 2 执行时：
+# 同样：计数器 1→2→1
+
+# 事务提交时：
+# commit() → __aexit__() → 计数器 1→0, release
+# 连接才真正返回池子！
+```
+
+#### 3.3 设计优势
+
+1. **性能优化**：避免事务期间频繁获取/释放连接
+2. **事务完整性**：确保同一事务内的所有操作使用同一个物理连接
+3. **隔离性保证**：不同事务使用不同连接，互不干扰
+
+### 4. Savepoint 机制详解
+
+#### 4.1 MySQL Savepoint 实现
+
+```python
+# databases/backends/mysql.py:249-291
+class MySQLTransaction(TransactionBackend):
+    def __init__(self, connection: MySQLConnection):
+        self._connection = connection
+        self._is_root = False
+        self._savepoint_name = ""
+
+    async def start(
+        self, is_root: bool, extra_options: typing.Dict[typing.Any, typing.Any]
+    ) -> None:
+        self._is_root = is_root
+        if self._is_root:
+            # 根事务：执行 BEGIN
+            await self._connection._connection.begin()
+        else:
+            # 嵌套事务：创建 SAVEPOINT
+            id = str(uuid.uuid4()).replace("-", "_")
+            self._savepoint_name = f"STARLETTE_SAVEPOINT_{id}"
+            cursor = await self._connection._connection.cursor()
+            try:
+                await cursor.execute(f"SAVEPOINT {self._savepoint_name}")
+            finally:
+                await cursor.close()
+
+    async def commit(self) -> None:
+        if self._is_root:
+            # 根事务：执行 COMMIT
+            await self._connection._connection.commit()
+        else:
+            # 嵌套事务：释放 SAVEPOINT
+            cursor = await self._connection._connection.cursor()
+            try:
+                await cursor.execute(f"RELEASE SAVEPOINT {self._savepoint_name}")
+            finally:
+                await cursor.close()
+
+    async def rollback(self) -> None:
+        if self._is_root:
+            # 根事务：执行 ROLLBACK
+            await self._connection._connection.rollback()
+        else:
+            # 嵌套事务：回滚到 SAVEPOINT
+            cursor = await self._connection._connection.cursor()
+            try:
+                await cursor.execute(f"ROLLBACK TO SAVEPOINT {self._savepoint_name}")
+            finally:
+                await cursor.close()
+```
+
+#### 4.2 Savepoint 命名规则
+
+**命名格式**：
+```
+STARLETTE_SAVEPOINT_{uuid4_with_underscores}
+```
+
+**生成规则**：
+1. 使用 `uuid.uuid4()` 生成唯一标识符
+2. 将 `-` 替换为 `_`（SQL 标识符规范）
+3. 前缀为 `STARLETTE_SAVEPOINT_`
+
+**示例**：
+```
+STARLETTE_SAVEPOINT_a1b2c3d4_e5f6_7890_abcd_ef1234567890
+```
+
+**设计考虑**：
+- UUID 确保全局唯一性，避免命名冲突
+- 使用 `_` 而非 `-` 符合 SQL 标识符规范
+- 前缀便于识别和调试
+
+#### 4.3 PostgreSQL Savepoint 实现
+
+PostgreSQL 的实现与 MySQL 不同，它直接使用 asyncpg 内置的事务 API：
+
+```python
+# databases/backends/postgres.py:200-218
+class PostgresTransaction(TransactionBackend):
+    def __init__(self, connection: PostgresConnection):
+        self._connection = connection
+        self._transaction: typing.Optional[asyncpg.transaction.Transaction] = None
+
+    async def start(
+        self, is_root: bool, extra_options: typing.Dict[typing.Any, typing.Any]
+    ) -> None:
+        # asyncpg 的 connection.transaction() 会自动处理嵌套
+        self._transaction = self._connection._connection.transaction(**extra_options)
+        await self._transaction.start()
+
+    async def commit(self) -> None:
+        await self._transaction.commit()
+
+    async def rollback(self) -> None:
+        await self._transaction.rollback()
+```
+
+**asyncpg 内部机制**：
+- asyncpg 的 `connection.transaction()` 方法会自动检测是否已有活跃事务
+- 如果已有活跃事务，它会自动创建 savepoint 而非新事务
+- 这种设计对上层代码透明，简化了 API
+
+### 5. 回滚时连接状态恢复
+
+#### 5.1 MySQL 回滚恢复
+
+| 事务类型 | 回滚操作 | 连接状态变化 |
+|----------|----------|--------------|
+| **根事务** | `ROLLBACK` | 回滚所有修改，回到自动提交状态 |
+| **嵌套事务** | `ROLLBACK TO SAVEPOINT` | 只回滚到 savepoint，外层事务继续活跃 |
+
+**根事务回滚示例**：
+```python
+async with db.transaction():  # 根事务
+    await db.execute("INSERT INTO users (name) VALUES ('Alice')")
+    
+    # 触发异常
+    raise Exception("Something went wrong")
+    
+# __aexit__ 检测到异常，调用 rollback()
+# MySQL 执行: ROLLBACK
+# 连接状态：所有修改被撤销，回到自动提交
+```
+
+**嵌套事务回滚示例**：
+```python
+async with db.transaction():  # 根事务 (is_root=True)
+    await db.execute("INSERT INTO users (name) VALUES ('Alice')")
+    
+    async with db.transaction():  # 嵌套事务 (is_root=False)
+        await db.execute("INSERT INTO users (name) VALUES ('Bob')")
+        
+        # 内层触发异常
+        raise Exception("Inner error")
+    
+    # 内层回滚后，外层继续
+    # 注意：如果内层异常未被捕获，外层也会回滚
+    
+# 如果内层异常被捕获：
+# - 内层: ROLLBACK TO SAVEPOINT → Bob 被撤销
+# - 外层: COMMIT → Alice 被保留
+```
+
+#### 5.2 PostgreSQL 回滚恢复
+
+PostgreSQL 使用 asyncpg 的内置事务管理：
+
+```python
+# asyncpg 的 transaction.rollback() 内部逻辑：
+# - 如果是根事务：执行 ROLLBACK
+# - 如果是嵌套事务（savepoint）：执行 ROLLBACK TO SAVEPOINT
+```
+
+**与 MySQL 的差异**：
+- PostgreSQL 不需要手动判断 `is_root`，asyncpg 内部处理
+- 但 `is_root` 参数仍然传递，用于可能的扩展选项
+
+#### 5.3 连接状态一致性保障
+
+无论 PostgreSQL 还是 MySQL，回滚后都确保：
+
+1. **连接引用计数正确**：`__aexit__()` 被调用，计数器递减
+2. **事务栈清理**：`_transaction_stack.pop()` 确保栈状态正确
+3. **上下文变量清理**：`self._transaction = None` 确保 ContextVar 更新
+4. **锁保护**：所有操作在 `_transaction_lock` 保护下执行
+
+### 6. 事务异常处理
+
+#### 6.1 `__aexit__` 中的异常检测
+
+```python
+# databases/core.py:416-428
+async def __aexit__(
+    self,
+    exc_type: typing.Optional[typing.Type[BaseException]] = None,
+    exc_value: typing.Optional[BaseException] = None,
+    traceback: typing.Optional[TracebackType] = None,
+) -> None:
+    """
+    Called when exiting `async with database.transaction()`
+    """
+    if exc_type is not None or self._force_rollback:
+        await self.rollback()
+    else:
+        await self.commit()
+```
+
+**回滚触发条件**：
+1. `exc_type is not None`: 上下文中发生异常
+2. `self._force_rollback`: 强制回滚模式（测试用）
+
+#### 6.2 异常场景流程图
+
+```
+场景：内层事务异常，外层捕获
+
+async with db.transaction():  # 外层 T1
+    await db.execute("INSERT INTO users VALUES (1)")  # 操作 A
+    
+    try:
+        async with db.transaction():  # 内层 T2
+            await db.execute("INSERT INTO users VALUES (2)")  # 操作 B
+            raise ValueError("Oops!")  # 异常
+    except ValueError:
+        pass  # 捕获异常，继续执行
+    
+    await db.execute("INSERT INTO users VALUES (3)")  # 操作 C
+
+# 执行流程：
+# 1. T1.start(): _transaction_stack=[T1], counter=1
+# 2. 操作 A: counter=1→2→1 (不 release)
+# 3. T2.start(): _transaction_stack=[T1,T2], counter=2
+# 4. 操作 B: counter=2→3→2
+# 5. 异常抛出 → 进入 T2.__aexit__
+# 6. exc_type is not None → T2.rollback()
+#    - MySQL: ROLLBACK TO SAVEPOINT (操作 B 撤销)
+#    - counter=2→1
+#    - _transaction_stack=[T1]
+# 7. 异常被 except 捕获
+# 8. 操作 C: counter=1→2→1
+# 9. T1.__aexit__: 无异常 → T1.commit()
+#    - MySQL: COMMIT (操作 A、C 保留)
+#    - counter=1→0, release()
+
+# 最终结果：
+# - 操作 A: 已提交 ✓
+# - 操作 B: 已回滚 ✗
+# - 操作 C: 已提交 ✓
+```
+
+### 7. 事务机制总结
+
+| 特性 | 实现方式 | 关键代码位置 |
+|------|----------|--------------|
+| **嵌套事务支持** | 事务栈 + Savepoint | `core.py:448-476` |
+| **连接 Pin 住** | 引用计数 + `__aenter__/__aexit__` | `core.py:453, 466, 475` |
+| **Savepoint 命名** | UUID + 固定前缀 | `mysql.py:263-264` |
+| **异常自动回滚** | `__aexit__` 检测 `exc_type` | `core.py:425-428` |
+| **线程安全** | `_transaction_lock` | `core.py:451, 461, 470` |
+
+---
+
 ## 线程安全保障机制
 
 ### 1. 多锁分层保护
