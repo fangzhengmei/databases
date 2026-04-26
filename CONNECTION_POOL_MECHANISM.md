@@ -327,6 +327,262 @@ def connection(self) -> "Connection":
 
 ---
 
+## 查询执行层连接使用机制
+
+### 1. execute、fetch_all、fetch_one 的连接获取与释放机制
+
+**核心模式**：所有普通查询方法都通过 `async with self.connection()` 上下文管理器来自动获取和释放连接。
+
+#### 1.1 Database 层的统一模式
+
+`Database` 类的 `fetch_all`、`fetch_one`、`fetch_val`、`execute`、`execute_many` 方法使用完全相同的连接管理模式：
+
+```python
+# databases/core.py:168-205
+async def fetch_all(self, query, values=None):
+    async with self.connection() as connection:  # 获取连接
+        return await connection.fetch_all(query, values)
+    # 退出上下文，自动释放连接
+
+async def fetch_one(self, query, values=None):
+    async with self.connection() as connection:
+        return await connection.fetch_one(query, values)
+
+async def execute(self, query, values=None):
+    async with self.connection() as connection:
+        return await connection.execute(query, values)
+```
+
+**执行流程**：
+1. `self.connection()`: 获取或创建当前任务对应的 `Connection` 实例
+2. `__aenter__()`: 增加引用计数，如果是 0→1 则真正 `acquire()` 连接
+3. 执行查询操作
+4. `__aexit__()`: 减少引用计数，如果是 1→0 则真正 `release()` 连接
+
+#### 1.2 Connection 层的查询执行
+
+`Connection` 层负责实际执行查询，并使用 `_query_lock` 确保同一连接上的查询串行执行：
+
+```python
+# databases/core.py:283-318
+async def fetch_all(self, query, values=None):
+    built_query = self._build_query(query, values)
+    async with self._query_lock:  # 确保查询串行化
+        return await self._connection.fetch_all(built_query)
+
+async def execute(self, query, values=None):
+    built_query = self._build_query(query, values)
+    async with self._query_lock:
+        return await self._connection.execute(built_query)
+```
+
+#### 1.3 完整生命周期示意图
+
+```
+执行 db.fetch_all("SELECT * FROM users"):
+
+时间线：
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  引用计数变化                                                                 │
+│       1 │    ████████                                                       │
+│       0 │████        ██████████████████████████████████████████████████████│
+└─────────┴───────────────────────────────────────────────────────────────────┘
+          ↑              ↑
+          acquire()      release()
+          
+阶段：
+1. async with self.connection() 进入
+   → Connection.__aenter__()
+   → _connection_counter: 0→1
+   → 真正 acquire() 连接
+
+2. 执行查询
+   → _build_query() 编译查询
+   → async with self._query_lock 确保串行化
+   → 后端实际执行查询
+
+3. 退出 async with 上下文
+   → Connection.__aexit__()
+   → _connection_counter: 1→0
+   → 真正 release() 连接
+   → 连接返回连接池
+
+**关键特点**：每次查询都是独立的连接生命周期：获取 → 执行 → 立即释放
+```
+
+---
+
+### 2. iterate 为什么要额外套一层 transaction() 上下文？
+
+**关键发现**：`Connection.iterate()` 内部使用了 `async with self.transaction()`，这是与普通查询最本质的区别。
+
+#### 2.1 双层上下文结构
+
+`iterate` 方法有两层上下文管理：
+
+**第一层（Database.iterate）**：获取连接
+```python
+# databases/core.py:207-214
+async def iterate(self, query, values=None):
+    async with self.connection() as connection:  # 第一层：获取连接
+        async for record in connection.iterate(query, values):
+            yield record
+```
+
+**第二层（Connection.iterate）**：开启事务（关键！）
+```python
+# databases/core.py:327-336
+async def iterate(self, query, values=None):
+    built_query = self._build_query(query, values)
+    async with self.transaction():  # 第二层：开启事务！
+        async with self._query_lock:
+            async for record in self._connection.iterate(built_query):
+                yield record
+```
+
+#### 2.2 为什么需要事务？
+
+**三个可能的原因**：
+
+| 原因 | 说明 |
+|------|------|
+| **数据一致性** | 迭代大结果集时，确保整个迭代期间看到的数据是一致的快照，避免其他并发修改导致数据变化 |
+| **驱动要求** | PostgreSQL 的服务器端游标（server-side cursor）通常需要在事务上下文中使用 |
+| **资源管理** | 事务上下文确保迭代异常时能够正确回滚和清理，特别是使用服务器端游标时 |
+
+#### 2.3 事务上下文与异步生成器的交互
+
+由于 `iterate` 是异步生成器（使用 `yield`），`async with self.transaction()` 上下文**不会在每次 `yield` 时退出**：
+
+```
+调用链：
+Connection.iterate()
+    │
+    ├── async with self.transaction():  ← 进入事务上下文
+    │       │
+    │       ├── Transaction.start()
+    │       │       ├── Connection.__aenter__()  → counter 1→2
+    │       │       └── 后端事务 start()
+    │       │
+    │       └── async for record in backend.iterate():
+    │               └── yield record  ← 暂停！上下文保持活跃
+    │
+    └── 只有迭代完全结束后才退出事务上下文
+            └── Transaction.__aexit__()
+                    ├── commit() 或 rollback()
+                    └── Connection.__aexit__()  → counter 2→1
+```
+
+---
+
+### 3. PostgreSQL 和 MySQL 的 iterate 实现与连接持有时机
+
+#### 3.1 PostgreSQL 后端实现
+
+```python
+# databases/backends/postgres.py:152-159
+async def iterate(self, query: ClauseElement):
+    assert self._connection is not None, "Connection is not acquired"
+    query_str, args, result_columns = self._compile(query)
+    column_maps = create_column_maps(result_columns)
+    # 直接使用 asyncpg 的 cursor() 方法返回异步迭代器
+    async for row in self._connection.cursor(query_str, *args):
+        yield Record(row, result_columns, self._dialect, column_maps)
+```
+
+**特点**：
+- 直接使用 asyncpg 的 `cursor()` 方法
+- asyncpg 的 cursor 是服务器端游标（server-side cursor）
+- 服务器端游标**必须在事务上下文中使用**
+
+#### 3.2 MySQL 后端实现
+
+```python
+# databases/backends/mysql.py:178-198
+async def iterate(self, query: ClauseElement):
+    assert self._connection is not None, "Connection is not acquired"
+    query_str, args, result_columns, context = self._compile(query)
+    column_maps = create_column_maps(result_columns)
+    dialect = self._dialect
+    cursor = await self._connection.cursor()
+    try:
+        await cursor.execute(query_str, args)
+        metadata = CursorResultMetaData(context, cursor.description)
+        async for row in cursor:  # 异步迭代 cursor
+            record = Row(metadata, metadata._processors, metadata._keymap, row)
+            yield Record(record, result_columns, dialect, column_maps)
+    finally:
+        await cursor.close()
+```
+
+**特点**：
+- 手动创建 cursor、执行查询
+- 然后异步迭代 cursor 的结果
+- 使用 `finally` 确保 cursor 关闭
+
+#### 3.3 普通查询 vs iterate：连接持有时机对比
+
+| 维度 | 普通查询 (fetch_all/execute) | iterate (异步生成器) |
+|------|-----------------------------|----------------------|
+| **连接获取时机** | 每次调用时 | 迭代开始时 |
+| **连接释放时机** | 执行完成后**立即**释放 | 迭代**完全结束**后释放 |
+| **连接持有时间** | 单次查询执行时间（毫秒级） | 整个迭代周期 + 数据处理时间（可能秒级或更长） |
+| **事务上下文** | 无（除非手动开启） | **自动开启事务** |
+| **引用计数变化** | 0→1→0（单次） | 0→1→2→1→0（双层上下文） |
+| **yield 影响** | 无（不是生成器） | `yield` 期间上下文保持活跃 |
+
+#### 3.4 时间线对比
+
+**普通查询**：
+```
+await db.fetch_all("SELECT * FROM users")
+
+时间线（毫秒级）：
+┌────────────────────────────────────────────────────────────────┐
+│  引用计数                                                        │
+│       1 │    ████                                               │
+│       0 │████        ██████████████████████████████████████████│
+└─────────┴───────────────────────────────────────────────────────┘
+          ↑    ↑
+          acquire release
+          连接持有时间极短！
+```
+
+**iterate**：
+```
+async for record in db.iterate("SELECT * FROM large_table"):
+    await process(record)  # 每条记录处理可能耗时很长
+
+时间线（秒级或更长）：
+┌────────────────────────────────────────────────────────────────┐
+│  引用计数                                                        │
+│       2 │              ████████████████████                    │
+│       1 │    ████████                          ████████        │
+│       0 │████                                      ████████████│
+└─────────┴───────────────────────────────────────────────────────┘
+          ↑              ↑                          ↑        ↑
+          acquire()      事务 start()               事务     release()
+          
+          ←──────────── 连接和事务一直保持活跃 ────────────→
+          期间用户在逐条处理记录！
+```
+
+---
+
+### 4. 关键设计要点总结
+
+| 设计点 | 代码位置 | 说明 |
+|--------|----------|------|
+| **普通查询自动管理连接** | `core.py:168-205` | 每次查询通过 `async with self.connection()` 自动获取/释放 |
+| **查询串行化** | `core.py:283-318` | `Connection` 层使用 `_query_lock` 确保同一连接上的查询串行执行 |
+| **iterate 双层上下文** | `core.py:207-214, 327-336` | 外层 `connection()` + 内层 `transaction()` |
+| **iterate 自动开启事务** | `core.py:327` | `async with self.transaction()` 确保数据一致性和驱动兼容性 |
+| **异步生成器保持连接** | 多处 `yield` | `yield` 期间上下文不会退出，连接和事务保持活跃 |
+| **PostgreSQL 服务器端游标** | `postgres.py:158` | `self._connection.cursor()` 需要事务上下文 |
+| **MySQL 手动 cursor 管理** | `mysql.py:185-197` | 手动创建 cursor，使用 `finally` 确保关闭 |
+
+---
+
 ## 事务机制深度分析
 
 ### 1. Transaction 类的核心设计
